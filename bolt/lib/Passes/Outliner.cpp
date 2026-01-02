@@ -1098,22 +1098,15 @@ bool isPCRelativeLiteralLoad(unsigned Opcode) {
   }
 }
 
-// 检查是否是不能 outline 的系统指令
-// 注意：内存屏障 (DMB/DSB/ISB) 可以安全 outline，因为它们的效果不依赖指令地址
+// Check if the instruction is a system instruction that cannot be outlined
 bool isMemoryBarrierOrSystemInstr(unsigned Opcode) {
   switch (Opcode) {
-  // Memory barriers - 可以 outline，效果不依赖地址
-  // case AArch64::DMB:
-  // case AArch64::DSB:
-  // case AArch64::ISB:
-  // case AArch64::TSB:
-
-  // System instructions - 不能 outline
+  // System instructions - cannot be outlined
   case AArch64::SYSxt:
   case AArch64::SYSLxt:
-  // Hint instructions - 大部分可以 outline，但保守处理
-  // case AArch64::HINT:
-  // Exception generating - 绝对不能 outline
+  // Hint instructions - most can be outlined, but handle conservatively
+  case AArch64::HINT:
+  // Exception generating instructions - cannot be outlined
   case AArch64::SVC:
   case AArch64::HVC:
   case AArch64::SMC:
