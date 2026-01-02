@@ -105,9 +105,7 @@ static bool areMCExprsEqual(const MCExpr *ExprA, const MCExpr *ExprB) {
   }
   case MCExpr::Target:
   case MCExpr::Specifier:
-    // For target-specific/specifier expressions, compare by kind only
-    // (conservative: may have false negatives)
-    return true;
+    return false;
   }
   return false;
 }
