@@ -24,6 +24,7 @@
 #include "bolt/Passes/LongJmp.h"
 #include "bolt/Passes/LoopInversionPass.h"
 #include "bolt/Passes/MCF.h"
+#include "bolt/Passes/Outliner.h"
 #include "bolt/Passes/PLTCall.h"
 #include "bolt/Passes/PatchEntries.h"
 #include "bolt/Passes/PointerAuthCFIAnalyzer.h"
@@ -205,6 +206,15 @@ static cl::opt<bool> PrintSimplifyROLoads(
 static cl::opt<bool>
     PrintSplit("print-split", cl::desc("print functions after code splitting"),
                cl::Hidden, cl::cat(BoltOptCategory));
+
+static cl::opt<bool>
+    EnableOutliner("enable-outliner", 
+                   cl::desc("enable code outlining pass"),
+                   cl::cat(BoltOptCategory));
+
+static cl::opt<bool>
+    PrintOutliner("print-outliner", cl::desc("print functions after outliner pass"),
+                  cl::Hidden, cl::cat(BoltOptCategory));
 
 static cl::opt<bool>
     PrintStoke("print-stoke", cl::desc("print functions after stoke analysis"),
@@ -563,6 +573,12 @@ Error BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
   // after this point.
   Manager.registerPass(
       std::make_unique<InstructionLowering>(PrintAfterLowering));
+
+  // add outliner pass
+  if (EnableOutliner) {
+    Manager.registerPass(
+        std::make_unique<Outliner>(PrintOutliner));
+  }
 
   // In non-relocation mode, mark functions that do not fit into their original
   // space as non-simple if we have to (e.g. for correct debug info update).

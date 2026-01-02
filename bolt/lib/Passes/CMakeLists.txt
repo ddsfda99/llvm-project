@@ -23,6 +23,7 @@ add_llvm_library(LLVMBOLTPasses
   LoopInversionPass.cpp
   LivenessAnalysis.cpp
   MCF.cpp
+  Outliner.cpp
   PatchEntries.cpp
   PAuthGadgetScanner.cpp
   PettisAndHansen.cpp
@@ -61,10 +62,17 @@ add_llvm_library(LLVMBOLTPasses
   Support
   TargetParser
   TransformUtils
+  Analysis
   )
 
 target_link_libraries(LLVMBOLTPasses
   PRIVATE
   LLVMBOLTCore
   LLVMBOLTUtils
+  )
+
+# Include AArch64 target directories for Outliner.cpp
+include_directories(
+  ${LLVM_MAIN_SRC_DIR}/lib/Target/AArch64
+  ${LLVM_BINARY_DIR}/lib/Target/AArch64
   )
