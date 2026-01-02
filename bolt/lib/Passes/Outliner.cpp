@@ -62,6 +62,10 @@ struct Replacement {
     unsigned NumToErase;        // Number of instructions to erase
     MCSymbol *CallTarget;       // Target symbol for the BL instruction
     bool NeedsPrologueEpilogue; // Indicates if prologue/epilogue is required
+    bool FromLeafFunction;      // Whether this replacement is in a leaf function
+    bool UseTailJump;           // 使用 B（尾跳转）而非 BL 调用 outlined function
+    bool EraseFollowingTerminator; // 删除序列后的 RET/B（尾跳转时需要）
+    MCPhysReg SaveLRReg;        // Register to save LR (X19-X28) if FromLeafFunction, 0 otherwise
 };
 
 /// Compare two MCExprs.
@@ -296,16 +300,18 @@ struct InstrLocation {
   BinaryBasicBlock *BB;
   bool ContainsCall;        // 该指令是否是 BL 指令
   bool HasSPRelativeAccess; // 该指令是否访问 SP-relative 内存
+  bool FromLeafFunction;    // 该指令是否来自叶子函数
   uint64_t ExecCount;       // 基本块的执行次数（用于冷/热判断）
 
   InstrLocation()
       : BB(nullptr), ContainsCall(false), HasSPRelativeAccess(false),
-        ExecCount(0) {}
+        FromLeafFunction(false), ExecCount(0) {}
   InstrLocation(BinaryBasicBlock::iterator It, BinaryBasicBlock *BB,
                 bool ContainsCall = false, bool HasSPRelativeAccess = false,
-                uint64_t ExecCount = 0)
+                bool FromLeafFunction = false, uint64_t ExecCount = 0)
       : It(It), BB(BB), ContainsCall(ContainsCall),
-        HasSPRelativeAccess(HasSPRelativeAccess), ExecCount(ExecCount) {}
+        HasSPRelativeAccess(HasSPRelativeAccess),
+        FromLeafFunction(FromLeafFunction), ExecCount(ExecCount) {}
 };
 
 /// Maps MCInsts to unsigned integers for suffix tree construction.
@@ -335,6 +341,7 @@ struct InstructionMapper {
   unsigned mapToLegalUnsigned(BinaryBasicBlock::iterator It,
                               BinaryBasicBlock *BB, bool ContainsCall = false,
                               bool HasSPRelativeAccess = false,
+                              bool FromLeafFunction = false,
                               uint64_t ExecCount = 0) {
     AddedIllegalLastTime = false;
 
@@ -347,7 +354,7 @@ struct InstructionMapper {
       LegalInstrNumber++;
 
     InstrList.push_back(
-        InstrLocation(It, BB, ContainsCall, HasSPRelativeAccess, ExecCount));
+        InstrLocation(It, BB, ContainsCall, HasSPRelativeAccess, FromLeafFunction, ExecCount));
     UnsignedVec.push_back(MINumber);
 
     // Ensure we don't overflow
@@ -359,7 +366,9 @@ struct InstructionMapper {
 
   /// Map an illegal (non-outlinable) instruction to a unique unsigned integer.
   unsigned mapToIllegalUnsigned(BinaryBasicBlock::iterator It,
-                                BinaryBasicBlock *BB, uint64_t ExecCount = 0) {
+                                BinaryBasicBlock *BB,
+                                bool FromLeafFunction = false,
+                                uint64_t ExecCount = 0) {
     // Only add one illegal number per range of legal numbers
     if (AddedIllegalLastTime)
       return IllegalInstrNumber + 1; // Return previous illegal number
@@ -367,7 +376,7 @@ struct InstructionMapper {
     AddedIllegalLastTime = true;
     unsigned MINumber = IllegalInstrNumber;
 
-    InstrList.push_back(InstrLocation(It, BB, false, false, ExecCount));
+    InstrList.push_back(InstrLocation(It, BB, false, false, FromLeafFunction, ExecCount));
     UnsignedVec.push_back(MINumber);
     IllegalInstrNumber--;
 
@@ -378,9 +387,9 @@ struct InstructionMapper {
   }
 
   /// Add a sentinel value to terminate a basic block's sequence.
-  void addSentinel(BinaryBasicBlock *BB, uint64_t ExecCount = 0) {
+  void addSentinel(BinaryBasicBlock *BB, bool FromLeafFunction = false, uint64_t ExecCount = 0) {
     AddedIllegalLastTime = false;
-    InstrList.push_back(InstrLocation(BB->end(), BB, false, false, ExecCount));
+    InstrList.push_back(InstrLocation(BB->end(), BB, false, false, FromLeafFunction, ExecCount));
     UnsignedVec.push_back(IllegalInstrNumber);
     IllegalInstrNumber--;
   }
@@ -604,55 +613,46 @@ static bool checkLivenessForOutlining(BinaryBasicBlock *BB,
   return true; // Safe to outline
 }
 
+// 检查指令序列是否读取 LR (X30)
+// 用于叶子函数 - 如果序列读取 LR，BL 会覆盖它，导致错误
+static bool sequenceReadsLR(BinaryBasicBlock::iterator StartIt,
+                            BinaryBasicBlock::iterator EndIt,
+                            const BinaryContext &BC) {
+  const MCRegisterInfo &MRI = *BC.MRI;
+  
+  for (auto It = StartIt; It != EndIt; ++It) {
+    const MCInst &Inst = *It;
+    const MCInstrDesc &Desc = BC.MII->get(Inst.getOpcode());
+    
+    // 检查显式使用（读取）LR
+    unsigned NumDefs = Desc.getNumDefs();
+    for (unsigned I = NumDefs; I < Inst.getNumOperands(); ++I) {
+      const MCOperand &Op = Inst.getOperand(I);
+      if (Op.isReg() && MRI.regsOverlap(Op.getReg(), AArch64::LR)) {
+        return true; // 序列读取 LR
+      }
+    }
+    
+    // 检查隐式使用 LR
+    ArrayRef<MCPhysReg> ImpUses = Desc.implicit_uses();
+    for (MCPhysReg Reg : ImpUses) {
+      if (MRI.regsOverlap(Reg, AArch64::LR)) {
+        return true;
+      }
+    }
+  }
+  
+  return false;
+}
+
+// Forward declaration (used before definition).
 // Forward declaration (used before definition).
 bool modifiesSP(const MCInst &Inst, const MCRegisterInfo &RegInfo);
 bool isPACInstr(unsigned Opcode);
 
 // 检查函数是否安全地“升级”为非叶子：不能有 CFI，不能修改/使用 SP
 // （当前 outline 逻辑没有全局偏移修正），避免已有框架被破坏。
-static bool canUpgradeLeafFunction(const BinaryFunction &BF,
-                                   const BinaryContext &BC) {
-  for (const BinaryBasicBlock &BB : BF) {
-    for (const MCInst &Inst : BB) {
-      if (BC.MIB->isCFI(Inst))
-        return false;
-      if (usesOrDefsReg(Inst, AArch64::SP, *BC.MRI))
-        return false;
-      if (modifiesSP(Inst, *BC.MRI))
-        return false;
-      if (isPACInstr(Inst.getOpcode()))
-        return false;
-    }
-  }
-  return true;
-}
 
-// 将叶子函数升级为保存/恢复 LR 的形式，以便可以在其中插入 BL。
-static bool upgradeLeafFunctionForOutlining(BinaryFunction &BF,
-                                            BinaryContext &BC) {
-  if (!canUpgradeLeafFunction(BF, BC))
-    return false;
-
-  BinaryBasicBlock &EntryBB = BF.front();
-  auto InsertPos = EntryBB.begin();
-  MCInst Push;
-  createPushRegisters(Push, AArch64::FP, AArch64::LR);
-  EntryBB.insertInstruction(InsertPos, Push);
-
-  // 在每个返回前插入 pop，保持 16B 对齐。
-  for (BinaryBasicBlock &BB : BF) {
-    for (auto It = BB.begin(); It != BB.end(); ++It) {
-      if (!BC.MIB->isReturn(*It))
-        continue;
-      MCInst Pop;
-      createPopRegisters(Pop, AArch64::FP, AArch64::LR);
-      BB.insertInstruction(It, Pop);
-      break; // 一个 BB 里通常只有一个 ret；避免重复插入
-    }
-  }
-
-  return true;
-}
 
 // 检查指令是否定义（写入）FP 寄存器
 // 只读 FP 的指令可以被 outline（FP 值在函数内是常量）
@@ -1326,6 +1326,84 @@ bool canOutlineCallInstruction(const MCInst &Inst, const BinaryContext &BC) {
   return true;
 }
 
+// 检测指令是否属于函数 prologue
+// Prologue 指令通常包括：
+//   - 保存 callee-saved 寄存器（stp/str 到栈）
+//   - 设置帧指针（mov x29, sp）
+//   - 分配栈空间（sub sp, sp, #imm）
+// 这些指令与函数帧结构紧密相关，不应被 outline
+bool isPrologueInstruction(const MCInst &Inst, const BinaryContext &BC,
+                           bool &PrologueEnded) {
+  if (PrologueEnded)
+    return false;
+
+  unsigned Opcode = Inst.getOpcode();
+
+  // 1. 检查 STP/STR pre-indexed（常见的 prologue 开始）
+  //    stp x29, x30, [sp, #-N]!  或  str xN, [sp, #-M]!
+  if (Opcode == AArch64::STPXpre || Opcode == AArch64::STPDpre ||
+      Opcode == AArch64::STRXpre || Opcode == AArch64::STRDpre) {
+    // 检查目标是否是 SP
+    for (unsigned I = 0; I < Inst.getNumOperands(); ++I) {
+      const MCOperand &Op = Inst.getOperand(I);
+      if (Op.isReg() && Op.getReg() == AArch64::SP)
+        return true; // prologue: 向栈保存寄存器
+    }
+  }
+
+  // 2. 检查 STP/STR 普通形式保存 callee-saved 寄存器
+  //    stp xN, xM, [sp, #offset]
+  if (Opcode == AArch64::STPXi || Opcode == AArch64::STPDi ||
+      Opcode == AArch64::STRXui || Opcode == AArch64::STRDui) {
+    // 检查是否存储到 SP 相对地址，且保存的是 callee-saved 寄存器
+    bool StoreToSP = false;
+    bool SavesCalleeSaved = false;
+    for (unsigned I = 0; I < Inst.getNumOperands(); ++I) {
+      const MCOperand &Op = Inst.getOperand(I);
+      if (!Op.isReg())
+        continue;
+      unsigned Reg = Op.getReg();
+      if (Reg == AArch64::SP)
+        StoreToSP = true;
+      // Callee-saved: x19-x28, x29(FP), x30(LR), d8-d15
+      if ((Reg >= AArch64::X19 && Reg <= AArch64::X28) ||
+          Reg == AArch64::FP || Reg == AArch64::LR ||
+          (Reg >= AArch64::D8 && Reg <= AArch64::D15))
+        SavesCalleeSaved = true;
+    }
+    if (StoreToSP && SavesCalleeSaved)
+      return true; // prologue: 保存 callee-saved 寄存器
+  }
+
+  // 3. 设置帧指针：mov x29, sp 或 add x29, sp, #0
+  if (Opcode == AArch64::ADDXri || Opcode == AArch64::ORRXrs) {
+    // 检查是否是 x29 = sp + imm 或 mov x29, sp
+    if (Inst.getNumOperands() >= 2) {
+      const MCOperand &Dst = Inst.getOperand(0);
+      const MCOperand &Src = Inst.getOperand(1);
+      if (Dst.isReg() && Dst.getReg() == AArch64::FP &&
+          Src.isReg() && Src.getReg() == AArch64::SP)
+        return true; // prologue: 设置帧指针
+    }
+  }
+
+  // 4. 分配栈空间：sub sp, sp, #imm
+  if (Opcode == AArch64::SUBXri) {
+    if (Inst.getNumOperands() >= 2) {
+      const MCOperand &Dst = Inst.getOperand(0);
+      const MCOperand &Src = Inst.getOperand(1);
+      if (Dst.isReg() && Dst.getReg() == AArch64::SP &&
+          Src.isReg() && Src.getReg() == AArch64::SP)
+        return true; // prologue: 分配栈空间
+    }
+  }
+
+  // 如果遇到非 prologue 指令，标记 prologue 结束
+  // prologue 应该是连续的，一旦遇到非 prologue 指令就结束
+  PrologueEnded = true;
+  return false;
+}
+
 // 检查指令是否可以安全地被 outline
 // 参考 LLVM MachineOutliner 的 AArch64 实现
 bool canOutlineInstruction(const MCInst &Inst, const BinaryContext &BC) {
@@ -1591,7 +1669,10 @@ struct OutlineCandidate {
   BinaryBasicBlock *BB; // The basic block containing this candidate
   bool ContainsCalls;   // Whether this sequence contains BL instructions
   bool EndsWithCall; // Whether the last instruction is a BL (for tail call opt)
+  bool FromLeafFunction; // Whether this candidate comes from a leaf function
+  bool CanUseTailJump;   // 是否可以用 B（尾跳转）调用：序列后直接是 RET 或 B
   uint64_t ExecCount; // 执行次数（用于 cost model）
+  unsigned CallOverhead; // 调用此候选的开销（字节数），逐候选计算
 
   unsigned getEndIdx() const { return StartIdx + Length - 1; }
 };
@@ -1627,9 +1708,11 @@ Error Outliner::runOnFunctions(BinaryContext &BC) {
     unsigned TotalBBs = 0;
     unsigned LegalInsts = 0;
     unsigned IllegalInsts = 0;
-    unsigned SkippedLeafFunctions = 0;
     unsigned SkippedHotBBs = 0;
     unsigned ColdBBs = 0;
+    unsigned EntryPointBBs = 0;
+    unsigned PrologueInstsSkipped = 0;
+    unsigned EntryPointInstsOutlined = 0;
 
     // 确定冷代码阈值
     // 如果用户指定了阈值，使用用户的值；否则使用 BOLT 默认的热代码阈值
@@ -1674,29 +1757,15 @@ Error Outliner::runOnFunctions(BinaryContext &BC) {
         continue;
 
       // 叶子函数处理：
-      // - 默认：跳过叶子函数（保守策略，确保正确性）
-      // - 可选：升级叶子函数为保存/恢复 LR 的形式（需要 -outliner-upgrade-leaf-functions）
-      if (isLeafFunction(BF, BC)) {
-        if (opts::OutlinerUpgradeLeafFunctions) {
-          // 尝试升级叶子函数
-          if (upgradeLeafFunctionForOutlining(BF, BC)) {
-            LLVM_DEBUG(dbgs() << "BOLT-OUTLINING: Upgraded leaf function "
-                              << BF.getPrintName() << " for outlining\n");
-            // 成功升级，继续处理
-          } else {
-            SkippedLeafFunctions++;
-            LLVM_DEBUG(dbgs() << "BOLT-OUTLINING: Cannot upgrade leaf function "
-                              << BF.getPrintName() << ", skipping\n");
-            continue;
-          }
-        } else {
-          SkippedLeafFunctions++;
-          LLVM_DEBUG(dbgs() << "BOLT-OUTLINING: Skipping leaf function "
-                            << BF.getPrintName()
-                            << " (use -outliner-upgrade-leaf-functions to enable)\n");
-          continue;
-        }
-      }
+      // 叶子函数不保存 LR，所以从它们 outline 代码时需要特殊处理。
+      // 当调用 outlined function 时，BL 会覆盖 LR（叶子函数的返回地址）。
+      //
+      // 安全策略：仍然收集叶子函数的指令，但在 Phase 3 中只允许：
+      // 1. 序列以 BL 结尾（可用尾调用优化：BL→B，不破坏 LR）
+      // 2. 序列不读取 LR
+      // 这样 outlined function 用 tail-call (B) 调用，不需要返回，不会破坏 LR
+      bool IsLeafFunc = isLeafFunction(BF, BC);
+      // 不再跳过叶子函数，而是标记它们，在 Phase 3 进行安全筛选
 
       TotalFunctions++;
 
@@ -1709,14 +1778,21 @@ Error Outliner::runOnFunctions(BinaryContext &BC) {
         // 获取基本块的执行次数
         uint64_t BBExecCount = BB.getKnownExecutionCount();
 
-        // Skip BBs that are not safe to outline (entry/landing pads/etc.)
-        if (!BB.canOutline() || BB.isEntryPoint()) {
+        // Skip BBs that are not safe to outline (landing pads/etc.)
+        // 注意：不再完全跳过 entry points，而是只跳过 prologue 指令
+        if (!BB.canOutline()) {
           if (!BB.empty()) {
-            Mapper.mapToIllegalUnsigned(BB.begin(), &BB, BBExecCount);
+            Mapper.mapToIllegalUnsigned(BB.begin(), &BB, IsLeafFunc, BBExecCount);
             IllegalInsts++;
           }
           continue;
         }
+
+        // Entry point 需要特殊处理：prologue 指令标记为 illegal
+        bool IsEntryBB = BB.isEntryPoint();
+        bool PrologueEnded = false;
+        if (IsEntryBB)
+          EntryPointBBs++;
 
         // Note: We no longer skip entire BBs ending with return.
         // Instead, we mark only the ret instruction itself as illegal
@@ -1734,7 +1810,7 @@ Error Outliner::runOnFunctions(BinaryContext &BC) {
                               << " >= " << ColdThreshold << ")\n");
             // 添加一个 illegal marker 来断开序列
             if (!BB.empty()) {
-              Mapper.mapToIllegalUnsigned(BB.begin(), &BB, BBExecCount);
+              Mapper.mapToIllegalUnsigned(BB.begin(), &BB, IsLeafFunc, BBExecCount);
               IllegalInsts++;
             }
             continue;
@@ -1749,6 +1825,17 @@ Error Outliner::runOnFunctions(BinaryContext &BC) {
           // Skip pseudo instructions (invisible)
           if (BC.MIB->isPseudo(*It)) {
             Mapper.AddedIllegalLastTime = false;
+            continue;
+          }
+
+          // Entry point: 检测并跳过 prologue 指令
+          // Prologue 指令与函数帧结构紧密相关，不应被 outline
+          if (IsEntryBB && isPrologueInstruction(*It, BC, PrologueEnded)) {
+            Mapper.mapToIllegalUnsigned(It, &BB, IsLeafFunc, BBExecCount);
+            IllegalInsts++;
+            PrologueInstsSkipped++;
+            LLVM_DEBUG(dbgs() << "BOLT-OUTLINING: Skipping prologue instruction in "
+                              << BF.getPrintName() << "\n");
             continue;
           }
 
@@ -1768,7 +1855,7 @@ Error Outliner::runOnFunctions(BinaryContext &BC) {
           if (HasSPAccess) {
             if (!canOutlineSPRelativeInstr(*It, *BC.MRI)) {
               // 偏移超出范围，不能 outline
-              Mapper.mapToIllegalUnsigned(It, &BB, BBExecCount);
+              Mapper.mapToIllegalUnsigned(It, &BB, IsLeafFunc, BBExecCount);
               CanOutlineWithPrevInstr = false;
               IllegalInsts++;
               continue;
@@ -1780,7 +1867,7 @@ Error Outliner::runOnFunctions(BinaryContext &BC) {
           // Branches and returns are illegal (they change control flow)
           // But calls (BL) can be outlined - we just need to save LR
           if (IsBranch || IsReturn) {
-            Mapper.mapToIllegalUnsigned(It, &BB, BBExecCount);
+            Mapper.mapToIllegalUnsigned(It, &BB, IsLeafFunc, BBExecCount);
             CanOutlineWithPrevInstr = false;
             IllegalInsts++;
           } else if (IsCall) {
@@ -1789,36 +1876,42 @@ Error Outliner::runOnFunctions(BinaryContext &BC) {
             if (canOutlineInstruction(*It, BC)) {
               Mapper.mapToLegalUnsigned(It, &BB, /*ContainsCall=*/true,
                                         /*HasSPRelativeAccess=*/false,
+                                        /*FromLeafFunction=*/IsLeafFunc,
                                         BBExecCount);
               if (CanOutlineWithPrevInstr)
                 HaveLegalRange = true;
               CanOutlineWithPrevInstr = true;
               LegalInsts++;
+              if (IsEntryBB && PrologueEnded)
+                EntryPointInstsOutlined++;
             } else {
-              Mapper.mapToIllegalUnsigned(It, &BB, BBExecCount);
+              Mapper.mapToIllegalUnsigned(It, &BB, IsLeafFunc, BBExecCount);
               CanOutlineWithPrevInstr = false;
               IllegalInsts++;
             }
           } else if (!canOutlineInstruction(*It, BC)) {
             // Illegal instruction
-            Mapper.mapToIllegalUnsigned(It, &BB, BBExecCount);
+            Mapper.mapToIllegalUnsigned(It, &BB, IsLeafFunc, BBExecCount);
             CanOutlineWithPrevInstr = false;
             IllegalInsts++;
           } else {
             // Legal instruction (including SP-relative that passed the check above)
             Mapper.mapToLegalUnsigned(It, &BB, /*ContainsCall=*/false,
                                       /*HasSPRelativeAccess=*/HasSPAccess,
+                                      /*FromLeafFunction=*/IsLeafFunc,
                                       BBExecCount);
             if (CanOutlineWithPrevInstr)
               HaveLegalRange = true;
             CanOutlineWithPrevInstr = true;
             LegalInsts++;
+            if (IsEntryBB && PrologueEnded)
+              EntryPointInstsOutlined++;
           }
         }
 
         // Add sentinel at end of BB to prevent cross-BB matching
         if (HaveLegalRange && !BB.empty()) {
-          Mapper.addSentinel(&BB, BBExecCount);
+          Mapper.addSentinel(&BB, IsLeafFunc, BBExecCount);
         }
       }
     }
@@ -1828,12 +1921,13 @@ Error Outliner::runOnFunctions(BinaryContext &BC) {
            << "\n";
     outs() << "BOLT-OUTLINING:   Total basic blocks processed: " << TotalBBs
            << "\n";
-    outs() << "BOLT-OUTLINING:   Leaf functions skipped (cannot upgrade): "
-           << SkippedLeafFunctions << "\n";
     if (ProfileAvailable && OnlyCold) {
       outs() << "BOLT-OUTLINING:   Cold BBs: " << ColdBBs << "\n";
       outs() << "BOLT-OUTLINING:   Hot BBs skipped: " << SkippedHotBBs << "\n";
     }
+    outs() << "BOLT-OUTLINING:   Entry point BBs: " << EntryPointBBs << "\n";
+    outs() << "BOLT-OUTLINING:   Prologue instructions skipped: " << PrologueInstsSkipped << "\n";
+    outs() << "BOLT-OUTLINING:   Entry point instructions collected: " << EntryPointInstsOutlined << "\n";
     outs() << "BOLT-OUTLINING:   Legal (outlinable) instructions: "
            << LegalInsts << "\n";
     outs() << "BOLT-OUTLINING:   Illegal (non-outlinable) instructions: "
@@ -1922,6 +2016,7 @@ Error Outliner::runOnFunctions(BinaryContext &BC) {
         bool CandHasSPAccess = false;
         bool CandEndsWithCall = false;               // 尾调用优化
         uint64_t CandExecCount = StartLoc.ExecCount; // 使用基本块的执行次数
+        bool CandFromLeafFunc = false;
         for (unsigned I = StartIdx; I <= EndIdx; ++I) {
           if (Mapper.InstrList[I].ContainsCall) {
             CandContainsCalls = true;
@@ -1935,6 +2030,9 @@ Error Outliner::runOnFunctions(BinaryContext &BC) {
             CandHasSPAccess = true;
             SeqContainsSPRelativeAccess = true;
           }
+          if (Mapper.InstrList[I].FromLeafFunction) {
+            CandFromLeafFunc = true;
+          }
         }
 
         // CRITICAL: Check liveness ONLY if the sequence contains SP-relative accesses
@@ -1947,13 +2045,70 @@ Error Outliner::runOnFunctions(BinaryContext &BC) {
           continue; // Skip this candidate due to liveness conflict
         }
 
+        // 关键安全检查：对于叶子函数，序列不能读取 LR
+        // 因为 BL 指令会覆盖 LR，如果序列依赖 LR 的值，就会出错
+        if (CandFromLeafFunc && sequenceReadsLR(SeqStartIt, SeqEndIt, BC)) {
+          LLVM_DEBUG(dbgs() << "BOLT-OUTLINING: Skipping leaf func candidate at "
+                            << BB->getName() << " - sequence reads LR\n");
+          continue;
+        }
+
+        // 检查是否可以用尾跳转 (B) 调用 outlined function
+        // 这对叶子函数很重要：如果序列后直接是 RET/B/BR，可以用 B 调用
+        // 不需要返回，从而避免 BL 覆盖 LR 的问题
+        bool CanUseTailJump = false;
+        if (SeqEndIt != BB->end()) {
+          // 检查序列后的下一条指令
+          const MCInst &NextInst = *SeqEndIt;
+          if (BC.MIB->isReturn(NextInst) || 
+              BC.MIB->isUnconditionalBranch(NextInst) ||
+              BC.MIB->isTailCall(NextInst)) {
+            CanUseTailJump = true;
+          }
+        } else {
+          // 序列是 BB 的最后几条指令，检查 BB 的后继
+          // 如果没有 fall-through 后继，可能是尾跳转
+          if (BB->succ_size() == 0 || 
+              (BB->succ_size() == 1 && BB->getFallthrough() == nullptr)) {
+            CanUseTailJump = true;
+          }
+        }
+        // 注意：CandEndsWithCall 只影响 outlined function 内部的尾调用优化
+        // 它不影响调用站点是否可以用尾跳转（B）调用 outlined function
+        // 调用站点的尾跳转只取决于序列后面是否紧跟 RET/B/BR
+
         OutlineCandidate Cand;
         Cand.StartIdx = StartIdx;
         Cand.Length = StringLen;
         Cand.BB = BB;
         Cand.ContainsCalls = CandContainsCalls;
         Cand.EndsWithCall = CandEndsWithCall;
+        Cand.FromLeafFunction = CandFromLeafFunc;
+        Cand.CanUseTailJump = CanUseTailJump;
         Cand.ExecCount = CandExecCount;
+        
+        // 计算此候选的 CallOverhead（基于 MachineOutliner 的逻辑）
+        // - 普通情况（LR 已保存在 prologue 中）：只需 BL = 4 bytes
+        // - 叶子函数 + 可用尾跳转：B = 4 bytes
+        // - 叶子函数 + 不能尾跳转：mov reg, lr + bl + mov lr, reg = 12 bytes
+        if (CandFromLeafFunc) {
+          if (CanUseTailJump) {
+            Cand.CallOverhead = 4;  // B (tail jump)
+          } else {
+            Cand.CallOverhead = 12; // 需要保存/恢复 LR
+          }
+        } else {
+          Cand.CallOverhead = 4;    // 普通 BL
+        }
+        
+        // 对于叶子函数的候选，暂时完全禁用
+        // TODO: 调试后重新启用
+        if (CandFromLeafFunc) {
+          LLVM_DEBUG(dbgs() << "BOLT-OUTLINING: Skipping leaf func candidate at "
+                            << BB->getName() << " - leaf functions disabled\n");
+          continue;
+        }
+        
         CandidatesForSeq.push_back(Cand);
       }
 
@@ -1963,12 +2118,33 @@ Error Outliner::runOnFunctions(BinaryContext &BC) {
         Seq.Length = StringLen;
         Seq.Candidates = std::move(CandidatesForSeq);
 
+        // 检查是否有候选来自叶子函数
+        bool AnyFromLeafFunction = false;
+        for (const auto &Cand : Seq.Candidates) {
+          if (Cand.FromLeafFunction) {
+            AnyFromLeafFunction = true;
+            break;
+          }
+        }
+        
+        // 检查是否所有叶子函数候选都可以使用尾跳转
+        bool AllLeafCanUseTailJump = true;
+        for (const auto &Cand : Seq.Candidates) {
+          if (Cand.FromLeafFunction && !Cand.CanUseTailJump) {
+            AllLeafCanUseTailJump = false;
+            break;
+          }
+        }
+
         // PLOS §4.1.6 Post-Link Shrink Wrapping:
-        // 只有当序列包含函数调用或 SP-relative 访问时才需要 prologue/epilogue
+        // 需要 prologue/epilogue 的情况：
         // - 包含调用：需要保存 LR（因为 BL 会覆盖 LR）
         // - 包含 SP-relative 访问：需要 prologue 来建立栈帧以便偏移修正
+        // - 来自叶子函数但不能使用尾跳转：需要保存 LR
+        // 注意：如果所有叶子函数候选都可以使用尾跳转，就不需要 prologue
+        bool LeafNeedsPrologue = AnyFromLeafFunction && !AllLeafCanUseTailJump;
         Seq.NeedsPrologueEpilogue =
-            SeqContainsCalls || SeqContainsSPRelativeAccess;
+            SeqContainsCalls || SeqContainsSPRelativeAccess || LeafNeedsPrologue;
 
         // PLOS §4.1.4 Tail Call Optimization:
         // 如果所有候选都以 BL 结尾，可以应用尾调用优化
@@ -2041,7 +2217,6 @@ Error Outliner::runOnFunctions(BinaryContext &BC) {
     // ============================================================
 
     const unsigned InstrSize = 4; // AArch64 fixed instruction size
-    const unsigned CallBytes = 4; // BL instruction size
     const unsigned FrameBytesWithPrologue = 12;   // stp + ldp + ret
     const unsigned FrameBytesWithoutPrologue = 4; // just ret (Shrink Wrapping)
     const unsigned FrameBytesWithTailCallAndPrologue =
@@ -2053,40 +2228,44 @@ Error Outliner::runOnFunctions(BinaryContext &BC) {
     const int64_t MinBenefitThreshold =
         0; // Allow any positive benefit (most aggressive)
 
-    auto computeBenefit = [&](unsigned SeqBytes, unsigned FrameBytes,
-                              unsigned NumOccurrences) -> int64_t {
-      const int64_t K = NumOccurrences;
-      return static_cast<int64_t>(SeqBytes) * (K - 1) -
-             static_cast<int64_t>(FrameBytes) -
-             static_cast<int64_t>(CallBytes) * K;
-    };
+    // Calculate benefit for a sequence with its candidates
+    // 新的 cost model：使用逐候选的 CallOverhead
+    // 基于 MachineOutliner 的公式：
+    // Benefit = K × SeqBytes - (Σ CallOverhead[i] + SeqBytes + FrameBytes)
+    //         = (K - 1) × SeqBytes - FrameBytes - Σ CallOverhead[i]
+    auto calculateBenefitForSequence = [&](const OutlinedSequence &Seq) -> int64_t {
+      const unsigned SeqBytes = Seq.Length * InstrSize;
+      const unsigned K = Seq.Candidates.size();
 
-    // Calculate benefit for each sequence using PLOS paper formula
-    auto calculateBenefit = [&](unsigned SeqLength, unsigned NumOccurrences,
-                                bool NeedsPrologue,
-                                bool EndsWithCall) -> int64_t {
-      // K = NumOccurrences
-      // SeqBytes = SeqLength * InstrSize
-      const unsigned K = NumOccurrences;
-      const unsigned SeqBytes = SeqLength * InstrSize;
+      // 计算所有候选的总 CallOverhead
+      unsigned TotalCallOverhead = 0;
+      for (const auto &Cand : Seq.Candidates) {
+        TotalCallOverhead += Cand.CallOverhead;
+      }
 
       // 尾调用优化：如果序列以 BL 结尾，可以省略 RET
       unsigned FrameBytes = FrameBytesWithoutPrologue;
-      if (EndsWithCall) {
+      if (Seq.EndsWithCall) {
         // 尾调用优化
-        FrameBytes = NeedsPrologue ? FrameBytesWithTailCallAndPrologue
-                                   : FrameBytesWithTailCallNoPrologue;
-      } else if (NeedsPrologue) {
+        FrameBytes = Seq.NeedsPrologueEpilogue ? FrameBytesWithTailCallAndPrologue
+                                               : FrameBytesWithTailCallNoPrologue;
+      } else if (Seq.NeedsPrologueEpilogue) {
         FrameBytes = FrameBytesWithPrologue;
       }
 
-      const int64_t Benefit =
-          computeBenefit(SeqBytes, FrameBytes, NumOccurrences);
+      // NotOutlinedCost = K × SeqBytes
+      // OutliningCost = TotalCallOverhead + SeqBytes + FrameBytes
+      // Benefit = NotOutlinedCost - OutliningCost
+      //         = K × SeqBytes - TotalCallOverhead - SeqBytes - FrameBytes
+      //         = (K - 1) × SeqBytes - TotalCallOverhead - FrameBytes
+      const int64_t NotOutlinedCost = K * SeqBytes;
+      const int64_t OutliningCost = TotalCallOverhead + SeqBytes + FrameBytes;
+      const int64_t Benefit = NotOutlinedCost - OutliningCost;
 
-      LLVM_DEBUG(dbgs() << "BOLT-OUTLINING: Benefit = (" << K << " - 1) × "
-                        << SeqBytes << " - " << FrameBytes << " - " << K
-                        << " × " << CallBytes << " = " << Benefit
-                        << (EndsWithCall ? " [tail-call]" : "") << "\n");
+      LLVM_DEBUG(dbgs() << "BOLT-OUTLINING: Benefit = " << K << " × " << SeqBytes
+                        << " - (" << TotalCallOverhead << " + " << SeqBytes
+                        << " + " << FrameBytes << ") = " << Benefit
+                        << (Seq.EndsWithCall ? " [tail-call]" : "") << "\n");
 
       return Benefit;
     };
@@ -2096,12 +2275,8 @@ Error Outliner::runOnFunctions(BinaryContext &BC) {
     // works better with our SuffixTree-based implementation.
     llvm::sort(SequencesToOutline,
                [&](const OutlinedSequence &A, const OutlinedSequence &B) {
-                 int64_t BenefitA =
-                     calculateBenefit(A.Length, A.Candidates.size(),
-                                      A.NeedsPrologueEpilogue, A.EndsWithCall);
-                 int64_t BenefitB =
-                     calculateBenefit(B.Length, B.Candidates.size(),
-                                      B.NeedsPrologueEpilogue, B.EndsWithCall);
+                 int64_t BenefitA = calculateBenefitForSequence(A);
+                 int64_t BenefitB = calculateBenefitForSequence(B);
                  // Primary: higher benefit first
                  if (BenefitA != BenefitB)
                    return BenefitA > BenefitB;
@@ -2142,10 +2317,15 @@ Error Outliner::runOnFunctions(BinaryContext &BC) {
       if (ValidCandidates.size() < MinOccurrences)
         continue;
 
-      // Apply cost model using PLOS paper formula
-      int64_t Benefit =
-          calculateBenefit(Seq.Length, ValidCandidates.size(),
-                           Seq.NeedsPrologueEpilogue, Seq.EndsWithCall);
+      // Apply cost model using per-candidate CallOverhead
+      // 创建临时序列用于计算收益
+      OutlinedSequence TempSeq;
+      TempSeq.Length = Seq.Length;
+      TempSeq.Candidates = ValidCandidates;
+      TempSeq.NeedsPrologueEpilogue = Seq.NeedsPrologueEpilogue;
+      TempSeq.EndsWithCall = Seq.EndsWithCall;
+      
+      int64_t Benefit = calculateBenefitForSequence(TempSeq);
       if (Benefit < MinBenefitThreshold) {
         SkippedNoBenefit++;
         continue;
@@ -2206,30 +2386,46 @@ Error Outliner::runOnFunctions(BinaryContext &BC) {
         }
 
         // Find the instruction range within the BB
-        BinaryBasicBlock::iterator CandStartIt =
-            Mapper.InstrList[Cand.StartIdx].It;
         BinaryBasicBlock::iterator CandEndIt =
             Mapper.InstrList[Cand.getEndIdx()].It;
+        ++CandEndIt; // Make it past-the-end for iteration
         BinaryBasicBlock *CandBB = Cand.BB;
 
+        Replacement R;
+        R.BB = CandBB;
+        R.CallTarget = OutlinedFunc->getSymbol();
+        R.NeedsPrologueEpilogue = Seq.NeedsPrologueEpilogue;
+        R.FromLeafFunction = Cand.FromLeafFunction;
+        R.UseTailJump = Cand.CanUseTailJump && Cand.FromLeafFunction;
+        R.SaveLRReg = 0;
+        R.EraseFollowingTerminator = false;
+        
+        // 对于叶子函数使用尾跳转时，如果序列后紧跟 RET/B，需要删除它
+        // 因为 outlined function 的 RET/B 会替代原来的
+        if (R.UseTailJump && CandEndIt != CandBB->end()) {
+          const MCInst &NextInst = *CandEndIt;
+          if (BC.MIB->isReturn(NextInst) || 
+              BC.MIB->isUnconditionalBranch(NextInst)) {
+            R.EraseFollowingTerminator = true;
+          }
+        }
+
+        // 计算索引
         unsigned StartIndex = 0;
         unsigned EndIndex = 0;
         unsigned Index = 0;
+        --CandEndIt; // Back to inclusive end
         for (auto It = CandBB->begin(); It != CandBB->end(); ++It, ++Index) {
-          if (&(*It) == &(*CandStartIt))
+          if (&(*It) == &(*Mapper.InstrList[Cand.StartIdx].It))
             StartIndex = Index;
           if (&(*It) == &(*CandEndIt)) {
             EndIndex = Index;
             break;
           }
         }
-
-        Replacement R;
-        R.BB = CandBB;
         R.StartIndex = StartIndex;
         R.NumToErase = EndIndex - StartIndex + 1;
-        R.CallTarget = OutlinedFunc->getSymbol();
-        R.NeedsPrologueEpilogue = Seq.NeedsPrologueEpilogue;
+        
         Replacements.push_back(R);
       }
     }
@@ -2252,12 +2448,9 @@ Error Outliner::runOnFunctions(BinaryContext &BC) {
     });
 
     unsigned ReplacementsDone = 0;
+    unsigned LeafFunctionSaves = 0;
     for (const Replacement &R : Replacements) {
       BinaryBasicBlock &BB = *R.BB;
-
-      // Create BL instruction
-      MCInst CallInst;
-      BC.MIB->createCall(CallInst, R.CallTarget, BC.Ctx.get());
 
       // Navigate to the start position
       auto It = BB.begin();
@@ -2267,9 +2460,55 @@ Error Outliner::runOnFunctions(BinaryContext &BC) {
       for (unsigned i = 0; i < R.NumToErase; ++i) {
         It = BB.eraseInstruction(It);
       }
+      
+      // 如果使用尾跳转且需要删除后面的终结指令（RET/B）
+      if (R.EraseFollowingTerminator && It != BB.end()) {
+        It = BB.eraseInstruction(It);
+      }
 
-      // Insert the call
-      BB.insertInstruction(It, std::move(CallInst));
+      // 处理调用 outlined function 的方式：
+      // 1. 如果 UseTailJump：使用 B（尾跳转），不返回，用于叶子函数
+      // 2. 如果 SaveLRReg != 0：保存/恢复 LR（旧方式，可能不安全，暂时保留）
+      // 3. 正常情况：使用 BL
+      if (R.UseTailJump) {
+        // 对于叶子函数的尾跳转优化：用 B 替代 BL
+        // 这样不会覆盖 LR，outlined function 的 RET 直接返回到原调用者
+        MCInst TailJump;
+        BC.MIB->createTailCall(TailJump, R.CallTarget, BC.Ctx.get());
+        BB.insertInstruction(It, std::move(TailJump));
+        LeafFunctionSaves++;
+      } else if (R.FromLeafFunction && R.SaveLRReg != 0) {
+        // 创建 mov SaveLRReg, x30 (ORR Xd, XZR, Xm)
+        MCInst SaveLR;
+        SaveLR.setOpcode(AArch64::ORRXrs);
+        SaveLR.addOperand(MCOperand::createReg(R.SaveLRReg)); // Rd
+        SaveLR.addOperand(MCOperand::createReg(AArch64::XZR)); // Rn = XZR
+        SaveLR.addOperand(MCOperand::createReg(AArch64::LR));  // Rm = X30
+        SaveLR.addOperand(MCOperand::createImm(0)); // shift = 0
+        It = BB.insertInstruction(It, std::move(SaveLR));
+        ++It;
+        
+        // 创建 BL
+        MCInst CallInst;
+        BC.MIB->createCall(CallInst, R.CallTarget, BC.Ctx.get());
+        It = BB.insertInstruction(It, std::move(CallInst));
+        ++It;
+        
+        // 创建 mov x30, SaveLRReg
+        MCInst RestoreLR;
+        RestoreLR.setOpcode(AArch64::ORRXrs);
+        RestoreLR.addOperand(MCOperand::createReg(AArch64::LR)); // Rd = X30
+        RestoreLR.addOperand(MCOperand::createReg(AArch64::XZR)); // Rn = XZR
+        RestoreLR.addOperand(MCOperand::createReg(R.SaveLRReg));  // Rm
+        RestoreLR.addOperand(MCOperand::createImm(0)); // shift = 0
+        BB.insertInstruction(It, std::move(RestoreLR));
+      } else {
+        // 正常情况：直接插入 BL
+        MCInst CallInst;
+        BC.MIB->createCall(CallInst, R.CallTarget, BC.Ctx.get());
+        BB.insertInstruction(It, std::move(CallInst));
+      }
+      
       ReplacementsDone++;
 
       // Print progress every 100 replacements or for the first few
@@ -2278,11 +2517,17 @@ Error Outliner::runOnFunctions(BinaryContext &BC) {
                << Replacements.size() << "] Replaced " << R.NumToErase
                << " insts in " << BB.getFunction()->getPrintName()
                << "::" << BB.getName() << " with call to "
-               << R.CallTarget->getName() << "\n";
+               << R.CallTarget->getName();
+        if (R.UseTailJump)
+          outs() << " (leaf-tail-jump)";
+        outs() << "\n";
       }
     }
     outs() << "BOLT-OUTLINING:   All " << ReplacementsDone
-           << " replacements applied successfully\n";
+           << " replacements applied successfully";
+    if (LeafFunctionSaves > 0)
+      outs() << " (" << LeafFunctionSaves << " tail-jumps for leaf functions)";
+    outs() << "\n";
 
     outs() << "BOLT-OUTLINING: === Phase 4 Complete ===\n";
     outs() << "BOLT-OUTLINING: ========== Iteration " << Iteration
