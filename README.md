@@ -1,7 +1,11 @@
 # Post-Link Outlining Pass for LLVM BOLT
 基于 LLVM BOLT 构建的 Post Link Outlining Pass，通过将重复的指令序列提取为函数来减小二进制代码体积。
+
 具体效果请参考[README.pdf](https://github.com/ddsfda99/llvm-project/blob/main/README.pdf)。
+
 编译好的llvm-bolt在本项目的build_bolt/bin/llvm-bolt。
+
+outliner pass的详细讲解在[Lab5（张子彤）.pptx](https://github.com/ddsfda99/llvm-project/blob/main/Lab5%EF%BC%88%E5%BC%A0%E5%AD%90%E5%BD%A4%EF%BC%89.pptx)。
 ## 概述
 Outliner Pass 识别出重复出现的指令序列，提取为独立的 outlined functions，原位置的代码则被替换为函数调用或无条件跳转。
 ## 优化技术
